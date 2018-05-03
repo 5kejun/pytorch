@@ -45,6 +45,10 @@ PY35 = sys.version_info >= (3, 5)
 WINDOWS = sys.platform == 'win32'
 
 
+def LSTMCellF(input, hx, cx, *params):
+    return LSTMCell(input, (hx, cx), *params)
+
+
 def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
     hx, cx = hidden
     gates = F.linear(input, w_ih, b_ih) + F.linear(hx, w_hh, b_hh)
@@ -65,93 +69,73 @@ def LSTMCellC(*args, **kwargs):
     return torch.cat((hy, cy))
 
 
+def get_lstm_inputs(self, device):
+    input = torch.randn(3, 10, dtype=torch.float, device=device)
+    hx = torch.randn(3, 20, dtype=torch.float, device=device)
+    cx = torch.randn(3, 20, dtype=torch.float, device=device)
+    module = nn.LSTMCell(10, 20).to(torch.float, device)  # Just to allocate weights with correct sizes
+    return (input, hx, cx) + tuple(module.parameters())
+
+
+
 class TestJit(TestCase):
-    maxDiff = None
+    def assertExpectedONNXGraph(self, trace, *args, **kwargs):
+        torch.onnx._optimize_trace(trace, aten=False)
+        self.assertExpectedGraph(trace, *args, **kwargs)
 
-    @contextmanager
-    def assertCompiled(self, compiled_fn):
-        self.assertIsInstance(compiled_fn, torch._C.CompiledFunction)
-        hits, misses = compiled_fn.hits, compiled_fn.misses
-        yield
-        self.assertLess(hits, compiled_fn.hits)
-        self.assertEqual(misses, compiled_fn.misses)
+    def assertExpectedGraph(self, trace, *args, **kwargs):
+        if isinstance(trace, torch._C.Graph):
+            graph = trace
+        else:
+            graph = trace.graph()
 
-    def assertExpectedTrace(self, trace, *args, **kwargs):
-        torch._C._jit_pass_lint(trace.graph())
-        torch._C._jit_pass_dce(trace.graph())
-        torch._C._jit_pass_lint(trace.graph())
-        trace.set_graph(torch._C._jit_pass_canonicalize(trace.graph()))
-        torch._C._jit_pass_lint(trace.graph())
-        self.assertExpected(str(trace), *args, **kwargs)
+        torch._C._jit_pass_lint(graph)
+        torch._C._jit_pass_dce(graph)
+        torch._C._jit_pass_lint(graph)
+        # TODO TODO TODO TODO: this doesn't work!!!
+        print(graph)
+        torch._C._jit_pass_canonicalize(graph)
+        print(graph)
+        torch._C._jit_pass_lint(graph)
+        self.assertExpected(str(graph), *args, **kwargs)
 
     def assertExportImport(self, trace, inputs):
         initializers = []
-        graph1 = trace.graph()
 
-        ge1 = torch._C.GraphExecutor(graph1, False)
-        out1 = ge1(*inputs)
+        def run(graph):
+            return torch._C.GraphExecutor(graph, False)(*inputs)
+
         proto, _ = trace.graph().export(initializers, onnx_opset_version=0,
                                         defer_weight_export=False, export_raw_ir=True)
+        self.assertFalse(initializers)
 
-        graph2, initializers = torch._C._jit_import_graph(proto)
-        ge2 = torch._C.GraphExecutor(graph2, False)
-        out2 = ge2(*inputs)
+        imported_graph, initializers = torch._C._jit_import_graph(proto)
+        self.assertFalse(initializers)
 
-        self.assertEqual(out1, out2)
+        self.assertEqual(run(trace.graph()), run(imported_graph))
 
     def test_simple(self):
-        x = Variable(torch.Tensor([0.4]), requires_grad=True)
-        y = Variable(torch.Tensor([0.7]), requires_grad=True)
+        x = torch.tensor([0.4], requires_grad=True)
+        y = torch.tensor([0.7], requires_grad=True)
 
         def f(x, y):
             return torch.sigmoid(torch.tanh(x * (x + y)))
 
         trace, z = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, y))
-
-    # matmul is currently implemented as a native function, which
-    # exercises different codepaths in the JIT.  The following two
-    # tests ensure that (1) matmul indeed traces into an atomic,
-    # native operation, and (2) the JIT knows how to run it
-
-    def test_matmul_native(self):
-        x = Variable(torch.Tensor([[0.4]]), requires_grad=True)
-        y = Variable(torch.Tensor([[0.7]]), requires_grad=True)
-
-        trace, z = torch.jit.get_trace_graph(lambda x, y: x.matmul(y), (x, y), nderivs=0)
-        torch._C._jit_pass_lint(trace.graph())
-        torch._C._jit_pass_dce(trace.graph())
-        self.assertExpectedTrace(trace)
-        self.assertExportImport(trace, (x, y))
-
-    def test_matmul_native_run(self):
-        x = Variable(torch.Tensor([[0.4]]), requires_grad=True)
-        y = Variable(torch.Tensor([[0.7]]), requires_grad=True)
-
-        @torch.jit.compile(nderivs=0)
-        def fn(x, y):
-            return x.matmul(y)
-
-        z = fn(x, y)
-        with self.assertCompiled(fn):
-            z2 = fn(x, y)
-        self.assertEqual(z, z2)
 
     # index-2 is not implemented in interpreter
     @unittest.expectedFailure
     def test_index(self):
-        x = Variable(torch.Tensor([0.4]), requires_grad=True)
-        y = Variable(torch.LongTensor([0]), requires_grad=True)
+        x = torch.tensor([0.4], requires_grad=True)
+        y = torch.tensor([0], dtype=torch.int64, requires_grad=True)
 
         @torch.jit.compile(nderivs=0)
         def fn(x, y):
             return x[y]
 
-        z = fn(x, y)
-        with self.assertCompiled(fn):
-            z2 = fn(x, y)
-        self.assertEqual(z, z2)
+        fn(x, y) # Fails
 
     # Backwards tracing was broken for indexing by a constant,
     # because it's internally implemented using as_strided,
@@ -159,26 +143,22 @@ class TestJit(TestCase):
     # currently supported.)  It currently works because
     # slice() is now not marked as traceable.
     def test_index_constant(self):
-        x = Variable(torch.Tensor([0.4]), requires_grad=True)
+        x = torch.tensor([0.4], requires_grad=True)
 
-        @torch.jit.compile(nderivs=1)
         def fn(x):
             return x[0]
 
-        z = fn(x)
-        z.backward()
-        grad = x.grad.clone()
-        x.grad.zero_()
-        with self.assertCompiled(fn):
-            z2 = fn(x)
-            z2.backward()
-            grad2 = x.grad.clone()
-        self.assertEqual(z, z2)
-        self.assertEqual(grad, grad2)
+        def run(f):
+            y = f(x)
+            grad = torch.autograd.grad(y, x)[0].clone()
+            return y, grad
+
+        traced_fn = torch.jit.trace(torch.ones(1))(fn)
+        self.assertEqual(run(fn), run(traced_fn))
 
     def test_scopes(self):
-        x = Variable(torch.Tensor([0.4]), requires_grad=True)
-        y = Variable(torch.Tensor([0.7]), requires_grad=True)
+        x = torch.tensor([0.4], requires_grad=True)
+        y = torch.tensor([0.7], requires_grad=True)
 
         def f(x, y):
             out = x + y
@@ -190,7 +170,7 @@ class TestJit(TestCase):
             return out
 
         trace, z = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, y))
 
     def test_scopes_intermediate_node(self):
@@ -200,12 +180,10 @@ class TestJit(TestCase):
                 return F.log_softmax(x, dim=0)
 
         net = Net()
-        t = Variable(torch.ones(2), requires_grad=True)
-        trace, _ = torch.jit.get_trace_graph(net, (t, ))
-        self.assertExportImport(trace, (t, ))
-        torch.onnx._optimize_trace(trace, False)
-
-        self.assertExpectedTrace(trace)
+        t = torch.ones(2, requires_grad=True)
+        trace, _ = torch.jit.get_trace_graph(net, (t,))
+        self.assertExportImport(trace, (t,))
+        self.assertExpectedONNXTrace(trace)
 
     def test_scopes_identity_node(self):
 
@@ -225,84 +203,38 @@ class TestJit(TestCase):
 
         model = Net()
 
-        t = Variable(torch.ones(1, 3, 227, 227), requires_grad=True)
+        t = torch.ones(1, 3, 227, 227, requires_grad=True)
 
         with torch.onnx.set_training(model, False):
-            trace, _ = torch.jit.get_trace_graph(model, (t, ))
+            trace, _ = torch.jit.get_trace_graph(model, (t,))
 
-        self.assertExportImport(trace, (t, ) + tuple(model.parameters()))
+        self.assertExportImport(trace, (t,) + tuple(model.parameters()))
+        self.assertExpectedONNXTrace(trace)
 
-        torch.onnx._optimize_trace(trace, False)
-
-        self.assertExpectedTrace(trace)
-
-    @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
-    @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
-    def test_lstm_fusion(self):
-        input = Variable(torch.randn(3, 10).float().cuda())
-        hx = Variable(torch.randn(3, 20).float().cuda())
-        cx = Variable(torch.randn(3, 20).float().cuda())
-        module = nn.LSTMCell(10, 20).float().cuda()  # Just to allocate weights with correct sizes
-
-        trace, _ = torch.jit.get_trace_graph(LSTMCell, (input, (hx, cx)) + tuple(module.parameters()))
-        torch._C._jit_pass_lint(trace.graph())
-        torch._C._jit_pass_dce(trace.graph())
-        torch._C._jit_pass_lint(trace.graph())
-        self.assertExportImport(trace, (input, hx, cx) + tuple(module.parameters()))
-        torch._C._jit_pass_fuse(trace.graph())
-        self.assertExpectedTrace(trace)
-
-    def run_lstm_fusion(self, use_cuda):
-        def to_type(x):
-            x = x.float()
-            if use_cuda:
-                x = x.cuda()
-            return x
-
-        def rand_v(a, b):
-            return Variable(to_type(torch.randn(a, b)))
-
-        input = rand_v(3, 10)
-        hx = rand_v(3, 20)
-        cx = rand_v(3, 20)
-        module = to_type(nn.LSTMCell(10, 20))  # Just to allocate weights with correct sizes
-
-        CompiledLSTMCell = torch.jit.compile(nderivs=0)(LSTMCell)
-
-        z = CompiledLSTMCell(input, (hx, cx), *module.parameters())
-        with self.assertCompiled(CompiledLSTMCell):
-            z2 = CompiledLSTMCell(input, (hx, cx), *module.parameters())
-        self.assertEqual(z, z2)
+    def run_lstm_fusion(self, device):
+        ge = self.checkGraphExecutor(LSTMCellF, get_lstm_inputs(device))
+        self.assertExpectedGraph(ge.graph)
 
     @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_run_lstm_fusion_cuda(self):
-        self.run_lstm_fusion(True)
+        self.run_lstm_fusion(torch.device('cuda'))
 
     @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
     def test_run_lstm_fusion_cpu(self):
-        self.run_lstm_fusion(False)
+        self.run_lstm_fusion(torch.device('cpu'))
 
     @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_run_lstm_fusion_concat(self):
-        input = Variable(torch.randn(3, 10).float().cuda())
-        hx = Variable(torch.randn(3, 20).float().cuda())
-        cx = Variable(torch.randn(3, 20).float().cuda())
-        module = nn.LSTMCell(10, 20).float().cuda()  # Just to allocate weights with correct sizes
-
-        CompiledLSTMCell = torch.jit.compile(nderivs=0)(LSTMCellC)
-
-        z = CompiledLSTMCell(input, (hx, cx), *module.parameters())
-        with self.assertCompiled(CompiledLSTMCell):
-            z2 = CompiledLSTMCell(input, (hx, cx), *module.parameters())
-        self.assertEqual(z, z2)
+        ge = self.checkGraphExecutor(LSTMCellF, get_lstm_inputs('cuda'))
+        self.assertExpectedGraph(ge.graph)
 
     @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_concat_fusion(self):
-        hx = Variable(torch.randn(3, 20).float().cuda())
-        cx = Variable(torch.randn(3, 20).float().cuda())
+        hx = torch.randn(3, 20, dtype=torch.float, device='cuda')
+        cx = torch.randn(3, 20, dtype=torch.float, device='cuda')
 
         def Foo(hx, cx):
             return torch.cat((hx + cx, hx * cx))
@@ -311,7 +243,7 @@ class TestJit(TestCase):
         self.assertExportImport(trace, (hx, cx))
         torch._C._jit_pass_lint(trace.graph())
         torch._C._jit_pass_fuse(trace.graph())
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     @unittest.skipIf(IS_WINDOWS, "NYI: fuser support for Windows")
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
@@ -319,15 +251,18 @@ class TestJit(TestCase):
         def f(x, y):
             z1, z2 = (x + y).chunk(2, dim=1)
             return z1 * z2
-        x = Variable(torch.randn(4, 4).float().cuda())
-        y = Variable(torch.randn(4, 4).float().cuda())
+        x = torch.randn(4, 4, dtype=torch.float, device='cuda')
+        y = torch.randn(4, 4, dtype=torch.float, device='cuda')
+
         trace, _ = torch.jit.get_trace_graph(f, (x, y), nderivs=0)
         torch._C._jit_pass_lint(trace.graph())
         torch._C._jit_pass_dce(trace.graph())
-        self.assertExpectedTrace(trace, 'raw')
+        torch._C._jit_pass_lint(trace.graph())
+        self.assertExpectedGraph(trace, 'raw')
         self.assertExportImport(trace, (x, y))
         torch._C._jit_pass_fuse(trace.graph())
-        self.assertExpectedTrace(trace)
+        torch._C._jit_pass_lint(trace.graph())
+        self.assertExpectedGraph(trace)
 
     def test_arg_configurations(self):
         """Different arg configurations should trigger different traces"""
@@ -388,7 +323,7 @@ class TestJit(TestCase):
         torch._C._jit_pass_lint(trace.graph())
         torch._C._jit_pass_cse(trace.graph())
 
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, y))
 
     def test_compile_run_twice(self):
@@ -484,7 +419,7 @@ class TestJit(TestCase):
         trace, out = torch.jit.get_trace_graph(MyFn.apply, x, nderivs=1)
         out.sum().backward()
         torch._C._jit_pass_dce(trace.graph())
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     def test_legacy_traced_module(self):
         input = Variable(torch.randn(3, 10))
@@ -571,7 +506,7 @@ class TestJit(TestCase):
         trace, inputs = torch._C._tracer_enter((x,) + tuple(m.parameters()), 0)
         y = m(inputs[0])
         torch._C._tracer_exit((y,))
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, inputs)
 
     def test_legacy_fail(self):
@@ -599,7 +534,7 @@ class TestJit(TestCase):
             return y
         y = fn(*inputs)
         torch._C._tracer_exit((y,))
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, inputs)
 
     def test_inplace_flags(self):
@@ -688,7 +623,7 @@ class TestJit(TestCase):
         torch._C._jit_pass_dce(trace.graph())
         # This is nondeterministic, see:
         #   https://github.com/ezyang/pytorch/issues/227
-        # self.assertExpectedTrace(trace)
+        # self.assertExpectedGraph(trace)
         self.skipTest("output is nondeterministic on Travis/Python 3.5")
 
     def test_backward_opaque(self):
@@ -711,7 +646,7 @@ class TestJit(TestCase):
         torch._C._jit_pass_dce(trace.graph())
         # This is nondeterministic, see:
         #   https://github.com/ezyang/pytorch/issues/227
-        # self.assertExpectedTrace(trace)
+        # self.assertExpectedGraph(trace)
         self.skipTest("output is nondeterministic on Travis/Python 3.5")
 
     def test_backward_closure(self):
@@ -944,12 +879,12 @@ class TestJit(TestCase):
     def test_batchnorm(self):
         x = Variable(torch.randn(2, 2, 2, 2).fill_(1.0), requires_grad=True)
         trace, _ = torch.jit.get_trace_graph(nn.BatchNorm2d(2), x)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     def test_dropout(self):
         x = Variable(torch.randn(2, 2).fill_(1.0), requires_grad=True)
         trace, _ = torch.jit.get_trace_graph(nn.Dropout(0.6), x)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     def test_batchnorm_run_twice(self):
         @torch.jit.compile(nderivs=0)
@@ -970,7 +905,7 @@ class TestJit(TestCase):
     def test_conv(self):
         x = Variable(torch.randn(20, 16, 50, 40).fill_(1.0), requires_grad=True)
         trace, _ = torch.jit.get_trace_graph(nn.Conv2d(16, 13, 3, bias=False), x)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     def test_reuse_function(self):
         @torch.jit.compile(nderivs=0)
@@ -1158,7 +1093,7 @@ class TestJit(TestCase):
         return
         x = Variable(torch.randn(10, 3, 224, 224).fill_(1.0), requires_grad=True)
         trace, _ = torch.jit.get_trace_graph(torchvision.models.AlexNet(), x)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, ))
         # NB: Purposely NOT testing protobuf export here
 
@@ -1199,7 +1134,7 @@ class TestJit(TestCase):
         trace, z = torch.jit.get_trace_graph(f, (x, ), nderivs=0)
         torch._C._jit_pass_lint(trace.graph())
         torch._C._jit_pass_dce(trace.graph())
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, ))
 
     def test_index_trace(self):
@@ -1208,7 +1143,7 @@ class TestJit(TestCase):
         z.sum().backward()
         torch._C._jit_pass_lint(trace.graph())
         torch._C._jit_pass_dce(trace.graph())
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
 
     def test_saved_output(self):
         x = Variable(torch.randn(4, 4), requires_grad=True)
@@ -1238,7 +1173,7 @@ class TestJit(TestCase):
     def test_nested_inplace(self):
         x = Variable(torch.randn(2, 2))
         trace, _ = torch.jit.get_trace_graph(lambda x: F.threshold(x, 0, 0, inplace=True), (x,), nderivs=0)
-        self.assertExpectedTrace(trace)
+        self.assertExpectedGraph(trace)
         self.assertExportImport(trace, (x, ))
 
     def checkGraphExecutor(self, func, reference_tensors, input_tensors=None,
@@ -1299,7 +1234,9 @@ class TestJit(TestCase):
 
         self.assertEqual(outputs, outputs_ge)
         self.assertEqual(grads, grads_ge)
-        self.assertEqual(grads2, grads2_ge)
+        self.assertEqual(grads2, grads2_ge, prec=1e-5 if input_tensors[0].dtype is torch.double else 1e-3)
+
+        return ge
 
     def run_ge_tests(self, optimize, use_cuda):
         def rand(*args):
